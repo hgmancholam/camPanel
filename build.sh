@@ -62,8 +62,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>local.campanel</string>
   <key>CFBundleIconFile</key><string>CamPanel</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.4</string>
-  <key>CFBundleVersion</key><string>5</string>
+  <key>CFBundleShortVersionString</key><string>1.5</string>
+  <key>CFBundleVersion</key><string>6</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSCameraUsageDescription</key><string>CamPanel muestra la imagen de la cámara para que veas el efecto de cada ajuste mientras lo mueves.</string>

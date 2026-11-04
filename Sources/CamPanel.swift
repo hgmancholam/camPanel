@@ -181,18 +181,18 @@ enum Meta {
         "gain":                            ("Ganancia", "Exposición"),
         "backlight_compensation":          ("Compensación de contraluz", "Exposición"),
         "auto_white_balance_temperature":  ("Balance de blancos", "Color"),
-        "white_balance_temperature":       ("Temperatura de color (K)", "Color"),
+        "white_balance_temperature":       ("Temperatura de color", "Color"),
         "auto_white_balance_component":    ("Balance de blancos por componente", "Color"),
         "saturation":                      ("Saturación", "Color"),
         "hue":                             ("Tono", "Color"),
-        "auto_hue":                        ("Tono automatico", "Color"),
+        "auto_hue":                        ("Tono automático", "Color"),
         "brightness":                      ("Brillo", "Imagen"),
         "contrast":                        ("Contraste", "Imagen"),
-        "auto_contrast":                   ("Contraste automatico", "Imagen"),
+        "auto_contrast":                   ("Contraste automático", "Imagen"),
         "gamma":                           ("Gamma", "Imagen"),
         "sharpness":                       ("Nitidez", "Imagen"),
         "power_line_frequency":            ("Frecuencia de red", "Imagen"),
-        "auto_focus":                      ("Enfoque automatico", "Enfoque y encuadre"),
+        "auto_focus":                      ("Enfoque automático", "Enfoque y encuadre"),
         "absolute_focus":                  ("Enfoque", "Enfoque y encuadre"),
         "absolute_zoom":                   ("Zoom", "Enfoque y encuadre"),
         "absolute_pan":                    ("Paneo", "Enfoque y encuadre"),
@@ -320,6 +320,21 @@ enum Meta {
         return isLocked(key, in: values) || (key == "gain" && isAutoExposure(values))
     }
 
+    /// Valor con unidades. UVC fija las de exposicion (100 us) y pan/tilt (segundos de arco).
+    static func format(_ key: String, _ value: Int) -> String {
+        let oneDecimal = FloatingPointFormatStyle<Double>.number.precision(.fractionLength(1)).grouping(.never)
+        switch key {
+        case "absolute_exposure_time":
+            return (Double(value) / 10).formatted(oneDecimal) + " ms"
+        case "white_balance_temperature":
+            return "\(value) K"
+        case panKey, tiltKey:
+            return (Double(value) / 3600).formatted(oneDecimal) + "°"
+        default:
+            return String(value)
+        }
+    }
+
     static func label(_ key: String) -> String {
         if let i = info[key] { return i.0 }
         return key.replacingOccurrences(of: "_", with: " ").capitalized
@@ -424,6 +439,10 @@ final class Store: ObservableObject {
         var out: [String: Int] = [:]
         for c in controls { out[c.key] = c.value }
         return out
+    }
+
+    var loginPresetName: String? {
+        return device.flatMap { config.loginPreset[$0.modelKey] }
     }
 
     func isLocked(_ key: String) -> Bool {
@@ -545,9 +564,9 @@ final class Store: ObservableObject {
                 let now = try self.readValues(uvcc, d)
                 DispatchQueue.main.async { self.merge(now, from: d) }
                 if let real = now[key], real != v {
-                    self.report("\(Meta.label(key)) = \(real) (la cámara ajustó \(v))")
+                    self.report("\(Meta.label(key)): \(Meta.format(key, real)) (la cámara ajustó \(Meta.format(key, v)))")
                 } else {
-                    self.report("\(Meta.label(key)) = \(v)")
+                    self.report("\(Meta.label(key)): \(Meta.format(key, v))")
                 }
             } catch {
                 self.report("\(Meta.label(key)): " + self.describe(error), error: true)
@@ -646,7 +665,7 @@ final class Store: ObservableObject {
 
     func restoreBaseline() {
         guard let d = device, let values = config.baseline[d.modelKey] else {
-            report("No hay valores iniciales guardados para esta camara", error: true)
+            report("No hay valores iniciales guardados para esta cámara", error: true)
             return
         }
         apply(values, label: "valores iniciales")
@@ -664,10 +683,12 @@ final class Store: ObservableObject {
                 return
             }
             config.loginPreset[d.modelKey] = selectedPreset
+            loginEnabled = true
             saveConfig()
             writeLaunchAgent(for: d, values: values)
         } else {
             config.loginPreset.removeValue(forKey: d.modelKey)
+            loginEnabled = false
             saveConfig()
             removeLaunchAgent(for: d)
         }
@@ -847,16 +868,28 @@ struct ContentView: View {
     @ObservedObject var store: Store
     @StateObject private var preview = Preview()
     @State private var showSaveSheet = false
+    @State private var showDeleteConfirm = false
     @State private var draftName = ""
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            leftColumn.frame(width: 392)
-            Divider()
-            rightColumn.frame(minWidth: 468)
+        NavigationSplitView {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 290, ideal: 320, max: 400)
+        } detail: {
+            detail
+                .navigationTitle("CamPanel")
         }
-        .frame(minWidth: 880, minHeight: 616)
+        .toolbar { toolbarContent }
+        .frame(minWidth: 860, minHeight: 600)
         .sheet(isPresented: $showSaveSheet) { saveSheet }
+        .confirmationDialog(
+            "¿Eliminar el preset \"\(store.selectedPreset)\"?",
+            isPresented: $showDeleteConfirm
+        ) {
+            Button("Eliminar", role: .destructive) { store.deleteSelectedPreset() }
+        } message: {
+            Text("Esta acción no se puede deshacer.")
+        }
         .onAppear { syncPreview() }
         .onChange(of: store.device?.id) { _ in syncPreview() }
     }
@@ -866,142 +899,226 @@ struct ContentView: View {
         preview.start(deviceNamed: d.name)
     }
 
-    // --- columna izquierda: camara, presets, vista previa ---
+    private func askToSave(named name: String) {
+        draftName = name
+        showSaveSheet = true
+    }
 
-    private var leftColumn: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                Picker("", selection: Binding(
-                    get: { store.device?.id ?? "" },
-                    set: { id in if let d = store.devices.first(where: { $0.id == id }) { store.select(d) } }
-                )) {
-                    if store.devices.isEmpty { Text("ninguna cámara detectada").tag("") }
-                    ForEach(store.devices) { d in Text(d.name).tag(d.id) }
-                }
-                .labelsHidden()
-                Button { store.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Volver a leer la cámara")
+    // --- barra de herramientas ---
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Picker("Cámara", selection: Binding(
+                get: { store.device?.id ?? "" },
+                set: { id in if let d = store.devices.first(where: { $0.id == id }) { store.select(d) } }
+            )) {
+                if store.devices.isEmpty { Text("Ninguna cámara").tag("") }
+                ForEach(store.devices) { d in Text(d.name).tag(d.id) }
             }
-            .controlSize(.small)
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .help("Cámara")
 
-            previewBox
-
-            HStack(spacing: 6) {
-                Picker("", selection: $store.selectedPreset) {
-                    if store.presetNames.isEmpty { Text("sin presets").tag("") }
-                    ForEach(store.presetNames, id: \.self) { Text($0).tag($0) }
-                }
-                .labelsHidden()
-                Button("Aplicar") { store.applySelectedPreset() }
-                    .disabled(store.selectedPreset.isEmpty || store.busy)
-                Button("Guardar…") { draftName = store.selectedPreset; showSaveSheet = true }
-                    .disabled(store.controls.isEmpty)
-                Button("Eliminar") { store.deleteSelectedPreset() }
-                    .disabled(store.selectedPreset.isEmpty)
+            Button { store.refreshDevices() } label: {
+                Label("Volver a leer", systemImage: "arrow.clockwise")
             }
-            .controlSize(.small)
+            .keyboardShortcut("r", modifiers: .command)
+            .help("Volver a leer la cámara (⌘R)")
 
-            Toggle("Aplicar este preset al iniciar sesión", isOn: Binding(
-                get: { store.loginEnabled },
-                set: { store.loginEnabled = $0; store.enableLogin($0) }
-            ))
-            .toggleStyle(.checkbox)
-            .controlSize(.small)
-            .disabled(store.selectedPreset.isEmpty)
-
-            Spacer(minLength: 0)
-
-            Button("Restaurar valores iniciales") { store.restoreBaseline() }
-                .controlSize(.small)
-                .disabled(store.controls.isEmpty || store.busy)
-
-            HStack(alignment: .top, spacing: 5) {
-                if store.busy { ProgressView().controlSize(.small).scaleEffect(0.6) }
-                Text(store.status)
-                    .font(.system(size: 10))
-                    .foregroundStyle(store.isError ? Color.red : Color.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .lineLimit(3)
-                Spacer(minLength: 0)
+            Button {
+                if preview.running { preview.stop() } else { syncPreview() }
+            } label: {
+                Label(preview.running ? "Apagar vista previa" : "Encender vista previa",
+                      systemImage: preview.running ? "video.fill" : "video.slash")
             }
-            .frame(height: 34, alignment: .top)
+            .help(preview.running ? "Apagar la vista previa" : "Encender la vista previa")
         }
-        .padding(12)
+    }
+
+    // --- barra lateral: vista previa y presets ---
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            previewBox.padding(12)
+            presetList
+            Divider()
+            presetFooter
+        }
     }
 
     private var previewBox: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 8).fill(Color.black)
+            Color.black
             if preview.running {
                 CameraPreview(session: preview.session)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
             } else {
-                VStack(spacing: 6) {
+                VStack(spacing: 8) {
                     Image(systemName: preview.denied ? "video.slash" : "video")
-                        .font(.title2).foregroundStyle(.secondary)
-                    Text(preview.denied
-                         ? "Sin permiso de cámara. Actívalo en Ajustes del Sistema, Privacidad y seguridad."
-                         : "Vista previa apagada")
-                        .font(.system(size: 10))
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 16)
+                        .font(.title2)
+                    Text(preview.denied ? "Sin permiso de cámara" : "Vista previa apagada")
+                        .font(.caption)
+                    if preview.denied {
+                        Button("Abrir Ajustes…") { openCameraPrivacy() }
+                            .controlSize(.small)
+                    }
+                }
+                .foregroundStyle(.white.opacity(0.7))
+            }
+        }
+        .aspectRatio(16 / 9, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12))
+        )
+    }
+
+    private func openCameraPrivacy() {
+        let link = "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera"
+        if let url = URL(string: link) { NSWorkspace.shared.open(url) }
+    }
+
+    private var presetList: some View {
+        List(selection: Binding<String?>(
+            get: { store.selectedPreset.isEmpty ? nil : store.selectedPreset },
+            set: { if let name = $0 { store.selectedPreset = name } }
+        )) {
+            Section("Presets") {
+                ForEach(store.presetNames, id: \.self) { name in
+                    HStack {
+                        Text(name).lineLimit(1)
+                        Spacer()
+                        if store.loginPresetName == name {
+                            Image(systemName: "power")
+                                .foregroundStyle(.secondary)
+                                .help("Se aplica al iniciar sesión")
+                        }
+                    }
+                    .tag(name)
+                    .contextMenu {
+                        Button("Aplicar") {
+                            store.selectedPreset = name
+                            store.applySelectedPreset()
+                        }
+                        Button("Reemplazar con los ajustes actuales…") { askToSave(named: name) }
+                        Divider()
+                        Button("Eliminar…") {
+                            store.selectedPreset = name
+                            showDeleteConfirm = true
+                        }
+                    }
                 }
             }
         }
-        .frame(height: 208)
-        .overlay(alignment: .bottomTrailing) {
-            Button(preview.running ? "Apagar" : "Encender") {
-                if preview.running { preview.stop() } else { syncPreview() }
+        .listStyle(.sidebar)
+        .overlay {
+            if store.presetNames.isEmpty {
+                VStack(spacing: 4) {
+                    Text("Sin presets").font(.callout).foregroundStyle(.secondary)
+                    Text("Ajusta la cámara y guarda esos valores con +")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 24)
             }
-            .controlSize(.mini)
-            .padding(6)
         }
     }
 
-    // --- columna derecha: todos los controles, sin scroll ---
+    private var presetFooter: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Aplicar al iniciar sesión", isOn: Binding(
+                get: { !store.selectedPreset.isEmpty && store.loginPresetName == store.selectedPreset },
+                set: { store.enableLogin($0) }
+            ))
+            .toggleStyle(.checkbox)
+            .disabled(store.selectedPreset.isEmpty)
 
-    private var rightColumn: some View {
+            HStack(spacing: 10) {
+                Button { askToSave(named: "") } label: { Image(systemName: "plus") }
+                    .buttonStyle(.borderless)
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(store.controls.isEmpty)
+                    .help("Guardar los ajustes actuales como preset (⌘S)")
+                Button { showDeleteConfirm = true } label: { Image(systemName: "minus") }
+                    .buttonStyle(.borderless)
+                    .disabled(store.selectedPreset.isEmpty)
+                    .help("Eliminar el preset seleccionado")
+                Spacer()
+                Button("Aplicar") { store.applySelectedPreset() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(store.selectedPreset.isEmpty || store.busy)
+            }
+        }
+        .padding(12)
+    }
+
+    // --- detalle: ajustes de la camara ---
+
+    private var detail: some View {
         Group {
             if store.uvcc == nil {
                 missingTool
             } else if store.controls.isEmpty {
-                VStack(spacing: 6) {
-                    Image(systemName: "slider.horizontal.3").font(.title).foregroundStyle(.secondary)
-                    Text("Sin controles que mostrar").font(.caption).foregroundStyle(.secondary)
+                VStack(spacing: 8) {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tertiary)
+                    Text("Sin controles que mostrar").foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                VStack(alignment: .leading, spacing: 9) {
+                Form {
                     ForEach(groups, id: \.self) { g in
-                        Text(g.uppercased())
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 2)
-                        ForEach(store.controls.filter { $0.group == g }) { c in
-                            row(for: c)
+                        Section(g) {
+                            ForEach(store.controls.filter { $0.group == g }) { c in
+                                row(for: c)
+                            }
                         }
                     }
-                    Spacer(minLength: 0)
                 }
-                .controlSize(.small)
-                .padding(12)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .formStyle(.grouped)
             }
         }
+        .safeAreaInset(edge: .bottom, spacing: 0) { statusBar }
+    }
+
+    private var statusBar: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 8) {
+                if store.busy {
+                    ProgressView().controlSize(.small)
+                } else if store.isError {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+                Text(store.status)
+                    .font(.callout)
+                    .foregroundStyle(store.isError ? Color.primary : Color.secondary)
+                    .lineLimit(2)
+                    .help(store.status)
+                Spacer()
+                Button("Restaurar valores iniciales") { store.restoreBaseline() }
+                    .disabled(store.controls.isEmpty || store.busy)
+                    .help("Vuelve a los valores que tenía la cámara la primera vez que CamPanel la leyó")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+        }
+        .background(.bar)
     }
 
     private var missingTool: some View {
         VStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle").font(.title).foregroundStyle(.orange)
-            Text("No encuentro uvcc, el motor que habla con la cámara.").font(.caption)
+            Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
+            Text("No encuentro uvcc, el motor que habla con la cámara.")
             Text("npm i -g uvcc")
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(.body, design: .monospaced))
                 .textSelection(.enabled)
                 .padding(6)
                 .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 5))
             Button("Buscar de nuevo") { store.uvcc = UVCC.locate(); store.refreshDevices() }
-                .controlSize(.small)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
@@ -1011,64 +1128,48 @@ struct ContentView: View {
         Meta.groupOrder.filter { g in store.controls.contains { $0.group == g } }
     }
 
-    private let labelWidth: CGFloat = 132
-
     @ViewBuilder
     private func row(for c: Ctl) -> some View {
         switch c.kind {
         case .toggle:
-            HStack(spacing: 8) {
-                Text(c.label).font(.system(size: 11)).frame(width: labelWidth, alignment: .leading)
-                Toggle("", isOn: Binding(
-                    get: { store.value(c.key) != 0 },
-                    set: { store.setLocal(c.key, $0 ? 1 : 0); store.commit(c.key) }
-                ))
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                Spacer(minLength: 0)
-            }
-            .frame(height: 20)
+            Toggle(c.label, isOn: Binding(
+                get: { store.value(c.key) != 0 },
+                set: { store.setLocal(c.key, $0 ? 1 : 0); store.commit(c.key) }
+            ))
+            .toggleStyle(.switch)
 
         case .options(let opts):
-            HStack(spacing: 8) {
-                Text(c.label).font(.system(size: 11)).frame(width: labelWidth, alignment: .leading)
-                Picker("", selection: Binding(
-                    get: { store.value(c.key) },
-                    set: { store.setLocal(c.key, $0); store.commit(c.key) }
-                )) {
-                    ForEach(opts) { o in Text(o.label).font(.system(size: 11)).tag(o.value) }
-                }
-                .labelsHidden()
-                .frame(maxWidth: 200)
-                Spacer(minLength: 0)
+            Picker(c.label, selection: Binding(
+                get: { store.value(c.key) },
+                set: { store.setLocal(c.key, $0); store.commit(c.key) }
+            )) {
+                ForEach(opts) { o in Text(o.label).tag(o.value) }
             }
-            .frame(height: 22)
 
         case .range(let lo, let hi):
-            HStack(spacing: 8) {
-                Text(c.label).font(.system(size: 11)).frame(width: labelWidth, alignment: .leading)
-                Slider(
-                    value: Binding(
-                        get: { Double(store.value(c.key)) },
-                        set: { store.setLocal(c.key, Int($0.rounded())) }
-                    ),
-                    in: Double(lo)...Double(max(hi, lo + 1)),
-                    step: 1,
-                    onEditingChanged: { editing in
-                        store.editingKey = editing ? c.key : nil
-                        if !editing { store.commit(c.key) }
-                    }
-                )
-                .controlSize(.mini)
-                Text("\(store.value(c.key))")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 40, alignment: .trailing)
+            // Sin `step`: en macOS dibuja una marca por valor. El binding ya redondea a entero.
+            LabeledContent(c.label) {
+                HStack(spacing: 10) {
+                    Slider(
+                        value: Binding(
+                            get: { Double(store.value(c.key)) },
+                            set: { store.setLocal(c.key, Int($0.rounded())) }
+                        ),
+                        in: Double(lo)...Double(max(hi, lo + 1)),
+                        onEditingChanged: { editing in
+                            store.editingKey = editing ? c.key : nil
+                            if !editing { store.commit(c.key) }
+                        }
+                    )
+                    .labelsHidden()
+                    .frame(minWidth: 180)
+                    Text(verbatim: Meta.format(c.key, store.value(c.key)))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: 66, alignment: .trailing)
+                }
             }
-            .frame(height: 20)
             .disabled(store.isLocked(c.key))
-            .opacity(store.isLocked(c.key) ? 0.45 : 1)
             .help(store.isLocked(c.key) ? "Lo controla el modo automático. Pásalo a Manual para ajustarlo." : "")
         }
     }
@@ -1076,25 +1177,33 @@ struct ContentView: View {
     // --- hoja de guardado ---
 
     private var saveSheet: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let name = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let replaces = store.presetNames.contains(name)
+        return VStack(alignment: .leading, spacing: 12) {
             Text("Guardar preset").font(.headline)
             Text("Se guardan los \(store.controls.count) valores actuales de la cámara.")
-                .font(.caption).foregroundStyle(.secondary)
-            TextField("Nombre, por ejemplo: Reunión, Grabación, Luz de tarde", text: $draftName)
+                .font(.callout).foregroundStyle(.secondary)
+            TextField("Nombre", text: $draftName, prompt: Text("Por ejemplo: Reunión, Grabación, Luz de tarde"))
+                .labelsHidden()
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 330)
+                .frame(width: 340)
+            if replaces {
+                Text("Reemplazará el preset que ya tiene ese nombre.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             HStack {
                 Spacer()
                 Button("Cancelar") { showSaveSheet = false }
-                Button("Guardar") {
+                    .keyboardShortcut(.cancelAction)
+                Button(replaces ? "Reemplazar" : "Guardar") {
                     store.savePreset(named: draftName)
                     showSaveSheet = false
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(draftName.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(name.isEmpty)
             }
         }
-        .padding(18)
+        .padding(20)
     }
 }
 
@@ -1108,6 +1217,8 @@ struct CamPanelApp: App {
         Window("CamPanel", id: "main") {
             ContentView(store: store)
         }
+        .defaultSize(width: 1000, height: 760)
+        .windowToolbarStyle(.unified(showsTitle: true))
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}

@@ -36,6 +36,10 @@ solo se usa durante el build para bajar uvcc dentro del bundle.
     ./build.sh                                       # deja build/CamPanel.app
     ./build.sh /Applications/CamPanel.app            # compila e instala
     ./build.sh build/CamPanel.app --no-embed         # sin motor embebido, usa el del sistema
+    ./package.sh                                     # compila y genera dist/CamPanel-<versión>.dmg
+
+El instalador no está firmado con un certificado de Apple: sirve para esta máquina, pero en
+otra Mac Gatekeeper pedirá autorizar la app a mano.
 
 ## Dónde vive el estado
 
@@ -62,6 +66,18 @@ un cambio de puerto USB o de dock.
 El orden de escritura importa: los modos automáticos se apagan antes de fijar el valor
 manual correspondiente. Por eso `auto_white_balance_temperature` se aplica antes que
 `white_balance_temperature`, y `auto_exposure_mode` antes que `absolute_exposure_time`.
+
+`uvcc import` escribe en paralelo e ignora los errores de cada control, así que no garantiza
+ese orden. Por eso los presets se importan dos veces y luego se compara lo que quedó.
+
+`absolute_pan_tilt` es un solo control UVC con dos valores. La app lo muestra como `Paneo` e
+`Inclinación` y lo guarda en los presets como `absolute_pan` y `absolute_tilt`.
+
+Comportamiento comprobado en la Logitech C920 (`046d:0892`):
+
+- `auto_exposure_mode` solo acepta 1 (manual) y 8 (automático)
+- Exposición, temperatura de color y enfoque se rechazan mientras su modo automático esté activo
+- La cámara redondea algunos valores: exposición 201 queda en 156 y enfoque 102 en 100
 
 "Restaurar valores iniciales" devuelve la cámara al estado que tenía la primera vez que la
 app la leyó, no a un default de fábrica: UVC no expone GET_DEF por esta vía.

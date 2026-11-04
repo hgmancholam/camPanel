@@ -129,6 +129,26 @@ struct Device: Identifiable, Hashable, Codable {
     }
 }
 
+/// Un control UVC puede traer un numero o varios: absolute_pan_tilt devuelve [pan, tilt].
+/// Un tipo inesperado queda vacio y se omite, para que un solo control no tumbe toda la lectura.
+struct UVCValue: Decodable {
+    let numbers: [Int]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let one = try? c.decode(Int.self) {
+            numbers = [one]
+        } else {
+            numbers = (try? c.decode([Int].self)) ?? []
+        }
+    }
+}
+
+struct UVCRange: Decodable {
+    let min: UVCValue
+    let max: UVCValue
+}
+
 struct Opt: Identifiable, Hashable {
     let value: Int
     let label: String
@@ -175,7 +195,8 @@ enum Meta {
         "auto_focus":                      ("Enfoque automatico", "Enfoque y encuadre"),
         "absolute_focus":                  ("Enfoque", "Enfoque y encuadre"),
         "absolute_zoom":                   ("Zoom", "Enfoque y encuadre"),
-        "absolute_pan_tilt":               ("Paneo e inclinación", "Enfoque y encuadre"),
+        "absolute_pan":                    ("Paneo", "Enfoque y encuadre"),
+        "absolute_tilt":                   ("Inclinación", "Enfoque y encuadre"),
         "absolute_roll":                   ("Rotación", "Enfoque y encuadre"),
         "absolute_iris":                   ("Diafragma", "Exposición")
     ]
@@ -212,9 +233,92 @@ enum Meta {
         "power_line_frequency",
         "auto_exposure_mode", "auto_exposure_priority", "absolute_exposure_time", "gain",
         "auto_white_balance_temperature", "white_balance_temperature",
-        "auto_focus", "absolute_focus", "absolute_zoom",
+        "auto_focus", "absolute_focus", "absolute_zoom", panKey, tiltKey,
         "backlight_compensation", "brightness", "contrast", "gamma", "hue", "saturation", "sharpness"
     ]
+
+    /// Modos que cada modelo acepta de verdad, cuando difieren del estandar. Probado en hardware:
+    /// la C920 (046d:0892) solo admite 1 y 8, y su modo 8 es el automatico normal.
+    static let modelOptions: [String: [String: [Opt]]] = [
+        "046d-0892": [
+            "auto_exposure_mode": [
+                Opt(value: 1, label: "Manual"),
+                Opt(value: 8, label: "Automático")
+            ]
+        ]
+    ]
+
+    static func options(for key: String, model: String) -> [Opt]? {
+        return modelOptions[model]?[key] ?? options[key]
+    }
+
+    // --- pan y tilt: en USB son un solo control con dos valores; en la app, dos sliders ---
+
+    static let panTiltKey = "absolute_pan_tilt"
+    static let panKey = "absolute_pan"
+    static let tiltKey = "absolute_tilt"
+
+    /// Pasa los valores de uvcc a un entero por control. Omite los que no se saben representar.
+    static func flatten(_ raw: [String: UVCValue]) -> [String: Int] {
+        var out: [String: Int] = [:]
+        for (key, value) in raw {
+            if key == panTiltKey, value.numbers.count == 2 {
+                out[panKey] = value.numbers[0]
+                out[tiltKey] = value.numbers[1]
+            } else if value.numbers.count == 1 {
+                out[key] = value.numbers[0]
+            }
+        }
+        return out
+    }
+
+    static func flatten(_ raw: [String: UVCRange]) -> [String: (min: Int, max: Int)] {
+        var out: [String: (min: Int, max: Int)] = [:]
+        for (key, range) in raw {
+            let lo = range.min.numbers, hi = range.max.numbers
+            if key == panTiltKey, lo.count == 2, hi.count == 2 {
+                out[panKey] = (lo[0], hi[0])
+                out[tiltKey] = (lo[1], hi[1])
+            } else if lo.count == 1, hi.count == 1 {
+                out[key] = (lo[0], hi[0])
+            }
+        }
+        return out
+    }
+
+    /// Argumentos de `uvcc set`. Mover pan o tilt obliga a enviar los dos valores.
+    static func setArgs(_ key: String, in values: [String: Int]) -> [String] {
+        if key == panKey || key == tiltKey {
+            return ["set", panTiltKey, String(values[panKey] ?? 0), String(values[tiltKey] ?? 0)]
+        }
+        return ["set", key, String(values[key] ?? 0)]
+    }
+
+    // --- controles que dependen de un modo automatico ---
+
+    /// La camara rechaza escribir estos controles mientras su modo automatico esta activo.
+    static func isLocked(_ key: String, in values: [String: Int]) -> Bool {
+        switch key {
+        case "absolute_exposure_time":
+            return isAutoExposure(values)
+        case "white_balance_temperature":
+            return (values["auto_white_balance_temperature"] ?? 0) != 0
+        case "absolute_focus":
+            return (values["auto_focus"] ?? 0) != 0
+        default:
+            return false
+        }
+    }
+
+    static func isAutoExposure(_ values: [String: Int]) -> Bool {
+        let mode = values["auto_exposure_mode"]
+        return mode == 2 || mode == 8
+    }
+
+    /// Controles cuyo valor lo decide la camara con estos modos: no se puede esperar que coincida.
+    static func isDriven(_ key: String, in values: [String: Int]) -> Bool {
+        return isLocked(key, in: values) || (key == "gain" && isAutoExposure(values))
+    }
 
     static func label(_ key: String) -> String {
         if let i = info[key] { return i.0 }
@@ -263,6 +367,9 @@ final class Store: ObservableObject {
     @Published var status: String = ""
     @Published var isError: Bool = false
     @Published var busy: Bool = false
+
+    /// Control que se esta arrastrando: una relectura no debe moverlo bajo el dedo.
+    var editingKey: String? = nil
 
     private var config = Config()
     private let work = DispatchQueue(label: "campanel.work")
@@ -319,6 +426,27 @@ final class Store: ObservableObject {
         return out
     }
 
+    func isLocked(_ key: String) -> Bool {
+        return Meta.isLocked(key, in: currentValues)
+    }
+
+    private func readValues(_ uvcc: UVCC, _ d: Device) throws -> [String: Int] {
+        return Meta.flatten(try uvcc.decode(d.args + ["export"], as: [String: UVCValue].self))
+    }
+
+    /// Actualiza los valores sin rehacer la lista, con lo que la camara dice tener.
+    private func merge(_ values: [String: Int], from d: Device) {
+        guard device?.id == d.id else { return }
+        for i in controls.indices where controls[i].key != editingKey {
+            if let v = values[controls[i].key] { controls[i].value = v }
+        }
+    }
+
+    private func describe(_ error: Error) -> String {
+        let text = error.localizedDescription
+        return text.contains("LIBUSB_TRANSFER_STALL") ? "la cámara rechazó ese valor" : text
+    }
+
     // --- dispositivos y controles ---
 
     func refreshDevices() {
@@ -362,15 +490,15 @@ final class Store: ObservableObject {
         busy = true
         work.async {
             do {
-                let values = try uvcc.decode(d.args + ["export"], as: [String: Int].self)
-                let ranges = (try? uvcc.decode(d.args + ["ranges"], as: [String: [String: Int]].self)) ?? [:]
+                let values = try self.readValues(uvcc, d)
+                let ranges = Meta.flatten(try uvcc.decode(d.args + ["ranges"], as: [String: UVCRange].self))
 
                 var list: [Ctl] = []
                 for (key, value) in values {
                     let kind: Kind
-                    if let r = ranges[key], let lo = r["min"], let hi = r["max"] {
-                        kind = (lo == 0 && hi == 1) ? .toggle : .range(lo, hi)
-                    } else if let opts = Meta.options[key] {
+                    if let r = ranges[key] {
+                        kind = (r.min == 0 && r.max == 1) ? .toggle : .range(r.min, r.max)
+                    } else if let opts = Meta.options(for: key, model: d.modelKey) {
                         kind = .options(opts)
                     } else {
                         kind = .range(0, max(value, 1))
@@ -408,12 +536,21 @@ final class Store: ObservableObject {
     func commit(_ key: String) {
         guard let uvcc = uvcc, let d = device else { return }
         let v = value(key)
+        let args = Meta.setArgs(key, in: currentValues)
         work.async {
             do {
-                try uvcc.run(d.args + ["set", key, String(v)])
-                self.report("\(Meta.label(key)) = \(v)")
+                try uvcc.run(d.args + args)
+                // La camara redondea (exposicion 201 queda en 156) y un cambio de modo mueve otros
+                // controles: lo que se muestra debe ser lo que ella dice, no lo que se pidio.
+                let now = try self.readValues(uvcc, d)
+                DispatchQueue.main.async { self.merge(now, from: d) }
+                if let real = now[key], real != v {
+                    self.report("\(Meta.label(key)) = \(real) (la cámara ajustó \(v))")
+                } else {
+                    self.report("\(Meta.label(key)) = \(v)")
+                }
             } catch {
-                self.report("\(Meta.label(key)): " + error.localizedDescription, error: true)
+                self.report("\(Meta.label(key)): " + self.describe(error), error: true)
                 DispatchQueue.main.async { self.loadControls() }
             }
         }
@@ -422,8 +559,26 @@ final class Store: ObservableObject {
     static func orderedJSON(_ values: [String: Int]) -> String {
         var keys = Meta.applyOrder.filter { values[$0] != nil }
         keys += values.keys.filter { !Meta.applyOrder.contains($0) }.sorted()
-        let body = keys.map { "  \"\($0)\": \(values[$0]!)" }.joined(separator: ",\n")
-        return "{\n" + body + "\n}\n"
+        var lines: [String] = []
+        for key in keys {
+            if key == Meta.panKey || key == Meta.tiltKey {
+                // Pan y tilt viajan juntos, en la posicion del primero que aparezca.
+                let pair = "[\(values[Meta.panKey] ?? 0), \(values[Meta.tiltKey] ?? 0)]"
+                let line = "  \"\(Meta.panTiltKey)\": \(pair)"
+                if !lines.contains(line) { lines.append(line) }
+            } else {
+                lines.append("  \"\(key)\": \(values[key]!)")
+            }
+        }
+        return "{\n" + lines.joined(separator: ",\n") + "\n}\n"
+    }
+
+    /// Lo que no quedo como se pidio, sin contar lo que decide un modo automatico.
+    static func mismatches(wanted: [String: Int], got: [String: Int]) -> [String] {
+        return wanted.keys.sorted().compactMap { key in
+            guard !Meta.isDriven(key, in: wanted), let real = got[key], real != wanted[key] else { return nil }
+            return "\(Meta.label(key)) quedó en \(real), no \(wanted[key]!)"
+        }
     }
 
     func apply(_ values: [String: Int], label: String) {
@@ -432,10 +587,18 @@ final class Store: ObservableObject {
         busy = true
         work.async {
             do {
+                // uvcc import escribe en paralelo e ignora los errores de cada control. La primera
+                // pasada deja fijos los modos; la segunda escribe los valores que dependian de ellos.
                 try uvcc.run(d.args + ["import"], input: payload)
-                self.report("Aplicado: \(label)")
+                try uvcc.run(d.args + ["import"], input: payload)
+                let off = Store.mismatches(wanted: values, got: try self.readValues(uvcc, d))
+                if off.isEmpty {
+                    self.report("Aplicado: \(label)")
+                } else {
+                    self.report("Aplicado \(label), pero " + off.joined(separator: "; "), error: true)
+                }
             } catch {
-                self.report(error.localizedDescription, error: true)
+                self.report(self.describe(error), error: true)
             }
             DispatchQueue.main.async {
                 self.busy = false
@@ -531,6 +694,8 @@ final class Store: ObservableObject {
         ARGS=(--vendor 0x\(String(d.vendor, radix: 16)) --product 0x\(String(d.product, radix: 16)))
         for _ in $(seq 1 20); do
           if "$NODE" "$UVCC" "${ARGS[@]}" export >/dev/null 2>&1; then
+            # Dos pasadas: la primera fija los modos, la segunda los valores que dependen de ellos.
+            "$NODE" "$UVCC" "${ARGS[@]}" import < "$CFG"
             "$NODE" "$UVCC" "${ARGS[@]}" import < "$CFG"
             exit $?
           fi
@@ -890,7 +1055,10 @@ struct ContentView: View {
                     ),
                     in: Double(lo)...Double(max(hi, lo + 1)),
                     step: 1,
-                    onEditingChanged: { editing in if !editing { store.commit(c.key) } }
+                    onEditingChanged: { editing in
+                        store.editingKey = editing ? c.key : nil
+                        if !editing { store.commit(c.key) }
+                    }
                 )
                 .controlSize(.mini)
                 Text("\(store.value(c.key))")
@@ -899,6 +1067,9 @@ struct ContentView: View {
                     .frame(width: 40, alignment: .trailing)
             }
             .frame(height: 20)
+            .disabled(store.isLocked(c.key))
+            .opacity(store.isLocked(c.key) ? 0.45 : 1)
+            .help(store.isLocked(c.key) ? "Lo controla el modo automático. Pásalo a Manual para ajustarlo." : "")
         }
     }
 
